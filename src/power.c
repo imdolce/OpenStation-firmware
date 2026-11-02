@@ -82,23 +82,31 @@ void power_init(void)
     output_disable();
 }
 
-void power_request(uint16_t duty_permille)
+static void request_limited(uint16_t duty_permille, bool calibration)
 {
     const tip_profile_t *p = profile_active();
     const measurement_t *m = measure_get();
     uint32_t limited = duty_permille > 1000U ? 1000U : duty_permille;
     if (limited > p->max_duty_permille) limited = p->max_duty_permille;
+    if (calibration && limited > 200U) limited = 200U;
 
     if (!m->quiet_sample_valid || !m->vin_valid || !m->tip_present || safety_latched())
         limited = 0;
     if (m->vin_mv > 0U && p->nominal_resistance_mohm > 0U) {
         uint64_t vin2 = (uint64_t)m->vin_mv * m->vin_mv;
-        uint32_t power_duty = (uint32_t)(((uint64_t)p->max_power_mw * 1000ULL *
+        uint32_t max_power_mw = p->max_power_mw > PROFILE_HARD_MAX_POWER_MW ?
+            PROFILE_HARD_MAX_POWER_MW : p->max_power_mw;
+        uint32_t power_duty = (uint32_t)(((uint64_t)max_power_mw * 1000ULL *
                                           p->nominal_resistance_mohm) / vin2);
         uint32_t voltage_duty = (uint32_t)(((uint64_t)p->rated_voltage_mv *
                                             p->rated_voltage_mv * 1000ULL) / vin2);
         if (limited > power_duty) limited = power_duty;
         if (limited > voltage_duty) limited = voltage_duty;
+        if (calibration) {
+            uint32_t calibration_duty = (uint32_t)((30000000ULL *
+                p->nominal_resistance_mohm) / vin2);
+            if (limited > calibration_duty) limited = calibration_duty;
+        }
     } else {
         limited = 0;
     }
@@ -119,6 +127,11 @@ void power_request(uint16_t duty_permille)
 #else
     s_status.output_armed = false;
 #endif
+}
+void power_request(uint16_t duty_permille) { request_limited(duty_permille, false); }
+void power_request_calibration(uint16_t duty_permille)
+{
+    request_limited(duty_permille, true);
 }
 
 void power_record_cycle_measurement(uint16_t on_current_ma, uint32_t vin_mv,

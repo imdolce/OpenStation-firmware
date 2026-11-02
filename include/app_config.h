@@ -7,7 +7,8 @@
 
 /* Release version and separate hardware-debug build counter. */
 #define STATION_FW_VERSION "0.1.0"
-#define STATION_FW_BUILD   14U
+#define STATION_FW_BUILD   16U
+#define STATION_FW_BUILD_SUFFIX "d"
 #define STATION_ADC_VREF_MV 3300UL
 #define STATION_ADC_FULL_SCALE 4095UL
 #define STATION_VIN_DIVIDER_RATIO 16.3f

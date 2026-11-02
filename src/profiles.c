@@ -32,20 +32,19 @@ _Static_assert(PROFILE_CUSTOM_PER_TIP * CUSTOM_SLOT_BYTES <= CUSTOM_PAGE_BYTES,
 #define P(ID, NAME, RMIN, RMAX, RNOM, UVPC, KP, KI, KD, PWR, DUTY, VRATED, TMAX) \
     {ID, NAME, 2, RMIN, RMAX, RNOM, UVPC, 25, KP, KI, KD, 800, \
      {100, 200, 300, 350, 400, 450}, PWR, DUTY, VRATED, \
-     5000, 15000, 300, 150, TMAX, 0}
+     5000, 15000, 300, 150, TMAX, 0, 0}
 
 static const tip_profile_t s_factory_profiles[] = {
-    P(1, "C115", 1200, 2400, 1800, 8200, 900, 560, 0, 400000, 600, 12000, 500),
-    P(2, "C210", 1500, 3000, 2200, 8200, 1000, 640, 0, 400000, 650, 16000, 500),
-    /* Effective C245 slope measured on this board: a 220 C indicated reading
-     * corresponded to 320 C externally, with both referenced to 25 C. */
-    P(3, "C245", 2000, 4000, 2500, 3500, 2048, 512, 128, 400000, 1000, 24000, 500),
-    P(4, "C470", 4000, 10000, 8000, 8200, 1400, 900, 0, 400000, 700, 24000, 500),
-    P(5, "T12", 6000, 10000, 8000, 8000, 1150, 720, 0, 400000, 750, 24000, 500),
-    P(6, "TX1", 2500, 9000, 5000, 8000, 1100, 700, 0, 400000, 700, 24000, 500),
-    P(7, "TX2", 2500, 9000, 5000, 8000, 1100, 700, 0, 400000, 700, 24000, 500),
-    P(8, "GOOT", 2000, 10000, 5000, 8000, 1100, 700, 0, 400000, 700, 24000, 500),
-    P(9, "APOLLO", 2000, 10000, 5000, 8000, 1200, 760, 0, 400000, 700, 24000, 500)
+    P(1, "C115", 1200, 2400, 1800, 1197, 900, 560, 0, 400000, 600, 12000, 500),
+    P(2, "C210", 1500, 3000, 2200, 1197, 1000, 640, 0, 150000, 650, 16000, 500),
+    /* Provisional cartridge estimates; saved calibrations are never overwritten. */
+    P(3, "C245", 2000, 4000, 2500, 5040, 2048, 512, 128, 200000, 1000, 24000, 500),
+    P(4, "C470", 4000, 10000, 8000, 5040, 1400, 900, 0, 400000, 700, 24000, 500),
+    P(5, "T12", 6000, 10000, 8000, 2646, 1150, 720, 0, 150000, 750, 24000, 500),
+    P(6, "TX1", 2500, 9000, 5000, 2646, 1100, 700, 0, 150000, 700, 24000, 500),
+    P(7, "TX2", 2500, 9000, 5000, 2646, 1100, 700, 0, 150000, 700, 24000, 500),
+    P(8, "GOOT", 2000, 10000, 5000, 5166, 1100, 700, 0, 150000, 700, 24000, 500),
+    P(9, "APOLLO", 2000, 10000, 5000, 5166, 1200, 760, 0, 200000, 700, 24000, 500)
 };
 
 static tip_profile_t s_profiles[sizeof(s_factory_profiles) / sizeof(s_factory_profiles[0])];
@@ -139,18 +138,44 @@ void profile_set_temp_uv_per_c(uint16_t v)
     if (v > 12000U) v = 12000U;
     editable()->temp_uv_per_c = v;
 }
-void profile_set_temp_offset_c(int16_t v)
+uint16_t profile_sensitivity_tenths(void)
 {
-    ensure_initialized();
-    if (v < -100) v = -100;
-    if (v > 100) v = 100;
-    editable()->temp_offset_c = v;
+    return (uint16_t)(((uint32_t)profile_active()->temp_uv_per_c * 10U + 63U) / 126U);
+}
+void profile_set_sensitivity_tenths(uint16_t value)
+{
+    if (value < 80U) value = 80U;
+    if (value > 950U) value = 950U;
+    profile_set_temp_uv_per_c((uint16_t)(((uint32_t)value * 126U + 5U) / 10U));
+}
+bool profile_apply_tip_setup(const tip_profile_t *candidate)
+{
+    if (candidate == NULL || candidate->temp_uv_per_c < 1000U ||
+        candidate->temp_uv_per_c > 12000U) return false;
+    *editable() = *candidate;
+    return true;
+}
+bool profile_above_300_verified(void)
+{
+    const tip_profile_t *p = profile_active();
+    return (p->room_reference_c & 0x80U) != 0U;
+}
+void profile_mark_sixpoint_complete(void)
+{
+    tip_profile_t *p = editable();
+    p->room_reference_c |= 0x80U;
+}
+void profile_set_sixpoint_complete(bool complete)
+{
+    tip_profile_t *p = editable();
+    if (complete) p->room_reference_c |= 0x80U;
+    else p->room_reference_c &= 0x7FU;
 }
 void profile_set_max_power_mw(uint32_t v)
 {
     ensure_initialized();
     if (v < 5000UL) v = 5000UL;
-    if (v > 400000UL) v = 400000UL;
+    if (v > PROFILE_HARD_MAX_POWER_MW) v = PROFILE_HARD_MAX_POWER_MW;
     editable()->max_power_mw = v;
 }
 void profile_set_sleep_temp_c(int16_t v)
@@ -219,7 +244,15 @@ int16_t profile_calibrate_temperature(int16_t base)
 {
     static const int16_t anchor[PROFILE_CAL_POINT_COUNT] = {100, 200, 300, 350, 400, 450};
     const tip_profile_t *p = profile_active();
-    if (base <= anchor[0]) return (int16_t)(((int32_t)base * p->temp_cal_c[0]) / anchor[0]);
+    if (base <= anchor[0]) {
+        if (p->revision >= 3U) {
+            int16_t room = p->room_reference_c & 0x3FU;
+            if (base <= room) return base;
+            return (int16_t)(base + ((int32_t)(base - room) *
+                (p->temp_cal_c[0] - anchor[0])) / (anchor[0] - room));
+        }
+        return (int16_t)(((int32_t)base * p->temp_cal_c[0]) / anchor[0]);
+    }
     for (uint8_t i = 1; i < PROFILE_CAL_POINT_COUNT; ++i) {
         if (base <= anchor[i]) {
             int32_t numerator = (int32_t)(base - anchor[i - 1U]) *
@@ -228,6 +261,8 @@ int16_t profile_calibrate_temperature(int16_t base)
                              (anchor[i] - anchor[i - 1U]));
         }
     }
+    if (p->revision >= 3U)
+        return (int16_t)(base + p->temp_cal_c[5] - anchor[5]);
     return (int16_t)(p->temp_cal_c[5] +
         ((int32_t)(base - anchor[5]) * (p->temp_cal_c[5] - p->temp_cal_c[4])) / 50);
 }

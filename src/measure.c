@@ -3,6 +3,7 @@
 #include "board.h"
 #include "control.h"
 #include "power.h"
+#include "settings.h"
 #include "profiles.h"
 #include "safety.h"
 #include "ch32x035.h"
@@ -83,8 +84,15 @@ static uint16_t current_raw_to_ma(uint16_t raw)
 static int16_t temperature_base_from_raw(uint16_t raw, const tip_profile_t *p)
 {
     uint32_t temp_uv = adc_raw_to_uv(raw);
+    /* The profile offset captures its calibration baseline. A shared manual
+     * room reference shifts the cold-junction estimate without rewriting that
+     * profile-specific intercept. No junction temperature sensor is fitted. */
+    int16_t reference_c = p->revision >= 3U &&
+        (p->room_reference_c & 0x3FU) <= 50U ?
+        (int16_t)(p->room_reference_c & 0x3FU) : 30;
     int32_t temp = p->temp_uv_per_c ?
-        (int32_t)(temp_uv / p->temp_uv_per_c) + p->temp_offset_c : 0;
+        (int32_t)(temp_uv / p->temp_uv_per_c) + p->temp_offset_c +
+        (int32_t)settings_room_temperature_c() - reference_c : 0;
     if (temp < -20) temp = -20;
     if (temp > 550) temp = 550;
     return (int16_t)temp;

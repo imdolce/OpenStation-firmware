@@ -9,6 +9,7 @@
 #include "safety.h"
 #include "settings.h"
 #include "ui.h"
+#include "tip_setup.h"
 
 static ST7735_Object_t s_lcd;
 
@@ -20,7 +21,7 @@ int main(void)
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_1);
 
     board_safe_boot();
-    if (CH32_ST7735_Init(&s_lcd, ST7735_ORIENTATION_PORTRAIT) != ST7735_OK) {
+    if (CH32_ST7735_Init(&s_lcd, ST7735_ORIENTATION_LANDSCAPE) != ST7735_OK) {
         while (1) { board_heater_gpio_off(); }
     }
     ST7735_ClearRawRAM(&s_lcd, COLOR_BLACK);
@@ -33,6 +34,7 @@ int main(void)
     safety_init();
     control_init();
     ui_init(&s_lcd);
+    tip_setup_init(&s_lcd);
     ui_render();
     board_buzzer_pattern(4);
     board_watchdog_start();
@@ -43,14 +45,16 @@ int main(void)
         int8_t rotation = input_take_rotation();
         if (rotation != 0) {
             board_buzzer_pattern(1);
-            if (!ui_fault_popup_active() && !ui_boot_warning_active()) {
+            if (tip_setup_active()) tip_setup_rotate(rotation);
+            else if (!ui_fault_popup_active() && !ui_boot_warning_active()) {
                 if (ui_settings_active()) ui_settings_rotate(rotation);
                 else control_rotate(rotation);
             }
         }
         button_event_t event = input_take_button_event();
         if (event != BUTTON_EVENT_NONE) board_buzzer_pattern(1);
-        if (event == BUTTON_EVENT_SHORT) {
+        if (tip_setup_active()) tip_setup_button((uint8_t)event);
+        else if (event == BUTTON_EVENT_SHORT) {
             if (ui_fault_popup_active()) ui_dismiss_fault_popup();
             else if (ui_boot_warning_active()) ui_dismiss_boot_warning();
             else if (ui_settings_active()) ui_settings_press();
@@ -68,16 +72,23 @@ int main(void)
         }
 
         bool new_sample = measure_take_new_quiet_sample();
-        if (new_sample) control_run_cycle();
-        if (power_take_cycle_event()) {
-            const control_status_t *c = control_get();
-            safety_supervise((uint8_t)c->state, c->heating_enabled);
+        if (new_sample) {
+            if (tip_setup_active()) tip_setup_sample();
+            else control_run_cycle();
         }
+        if (power_take_cycle_event()) {
+            if (!tip_setup_active()) {
+                const control_status_t *c = control_get();
+                safety_supervise((uint8_t)c->state, c->heating_enabled);
+            }
+        }
+        tip_setup_poll();
 
         uint32_t now = board_millis();
         if ((uint32_t)(now - last_ui) >= UI_REFRESH_MS) {
             last_ui = now;
-            ui_render();
+            if (tip_setup_active()) tip_setup_render();
+            else ui_render();
         }
         board_watchdog_feed();
     }

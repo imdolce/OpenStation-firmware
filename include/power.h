@@ -14,6 +14,7 @@ typedef struct {
 
 void power_init(void);
 void power_request(uint16_t duty_permille);
+void power_request_calibration(uint16_t duty_permille);
 void power_record_cycle_measurement(uint16_t on_current_ma, uint32_t vin_mv,
                                     uint16_t on_ticks);
 void power_emergency_stop_isr(void);

@@ -10,6 +10,7 @@ static uint16_t s_press_ms;
 static uint16_t s_click_wait_ms;
 static uint8_t s_click_pending;
 static bool s_encoder_reversed;
+static volatile bool s_setup_mode;
 
 void input_init(void)
 {
@@ -31,9 +32,14 @@ void input_tick_isr(void)
 
     if (s_button_integrator == 20U) {
         if (s_press_ms < 2000U) ++s_press_ms;
-        if (s_press_ms == 800U) { s_button_event = BUTTON_EVENT_LONG; s_click_pending = 0; }
+        if (s_press_ms == 800U) {
+            s_button_event = BUTTON_EVENT_LONG; s_click_pending = 0;
+        }
     } else if (s_button_integrator == 0U && s_press_ms != 0U) {
-        if (s_press_ms < 800U) {
+        if (s_setup_mode && s_press_ms < 800U) {
+            s_button_event = BUTTON_EVENT_SHORT;
+            s_click_pending = 0;
+        } else if (s_press_ms < 800U) {
             if (s_click_pending) { s_button_event = BUTTON_EVENT_DOUBLE; s_click_pending = 0; }
             else { s_click_pending = 1; s_click_wait_ms = 300U; }
         }
@@ -43,6 +49,12 @@ void input_tick_isr(void)
         s_button_event = BUTTON_EVENT_SHORT;
         s_click_pending = 0;
     }
+}
+void input_set_setup_mode(bool enabled)
+{
+    s_setup_mode = enabled;
+    s_click_pending = 0U;
+    s_click_wait_ms = 0U;
 }
 
 int8_t input_take_rotation(void)

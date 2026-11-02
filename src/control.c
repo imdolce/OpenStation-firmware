@@ -5,6 +5,7 @@
 #include "power.h"
 #include "profiles.h"
 #include "safety.h"
+#include "settings.h"
 
 static volatile control_status_t s_control;
 static uint8_t s_tip_stable;
@@ -366,6 +367,7 @@ bool control_select_custom_profile(uint8_t family, uint8_t slot)
 void control_short_press(void)
 {
     s_control.inactivity_ms = 0;
+    if (!settings_setup_complete()) { power_force_off(); return; }
     if (safety_latched()) { if (safety_acknowledge()) enter_state(STATE_IDLE); return; }
     if (active_state(s_control.state)) {
         s_control.heating_enabled = false;

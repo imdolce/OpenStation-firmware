@@ -1,6 +1,6 @@
 # "OpenStation" project - Open source firmware for "Trạm hàn v4" (Soldering station v4)
 
-OpenStation is an alternative open source firmware for the "Trạm hàn v4"  (Soldering station v4) - phần cứng mạch bởi **toanthodien16**. This guide describes the **current source: version 0.1.0, Build 14**. 
+OpenStation is an alternative open source firmware for the "Trạm hàn v4"  (Soldering station v4) - phần cứng mạch bởi **toanthodien16**. This guide describes the **current source: version 0.1.0, Build 16d**. 
 
 Special thanks to the AxxSolder project (https://github.com/AxxAxx/AxxSolder) for inspiring the UI design and control logic.
 

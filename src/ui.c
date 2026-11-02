@@ -9,6 +9,7 @@
 #include "profiles.h"
 #include "safety.h"
 #include "settings.h"
+#include "tip_setup.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -62,7 +63,10 @@ static uint8_t s_calibration_point;
 static int16_t s_calibration_values[PROFILE_CAL_POINT_COUNT];
 static int16_t s_calibration_original[PROFILE_CAL_POINT_COUNT];
 static int16_t s_calibration_previous_target;
+static bool s_calibration_original_verified;
 static uint32_t s_calibration_stable_since_ms;
+#define CAL_WIZARD_POINT_COUNT 3U
+static const uint8_t s_calibration_wizard_indices[CAL_WIZARD_POINT_COUNT] = {1U, 2U, 4U};
 typedef enum {
     PROFILE_VIEW_ROOT, PROFILE_VIEW_CREATE_TIP, PROFILE_VIEW_NAME,
     PROFILE_VIEW_CREATE_FINISH, PROFILE_VIEW_MANAGE_TIP,
@@ -82,7 +86,7 @@ enum {
     SET_TIP_C115 = 0, SET_TIP_C210, SET_TIP_C245, SET_TIP_C470,
     SET_TIP_T12, SET_TIP_TX1, SET_TIP_TX2, SET_TIP_GOOT, SET_TIP_APOLLO,
     SET_PRESET_1, SET_PRESET_2, SET_PRESET_3,
-    SET_TC_SCALE, SET_TC_OFFSET, SET_PROFILE_DEFAULT_TEMP,
+    SET_TC_SCALE, SET_PROFILE_DEFAULT_TEMP,
     SET_PROFILE_MAX_TEMP, SET_MAX_POWER,
     SET_KP, SET_KI, SET_KD, SET_MAX_I,
     SET_CAL_FOLDER,
@@ -115,7 +119,7 @@ static const uint8_t s_tip_items[] = {
 };
 static const uint8_t s_profile_items[] = {
     SET_PROFILE_DEFAULT_TEMP, SET_PROFILE_MAX_TEMP, SET_SLEEP_TEMP,
-    SET_TC_SCALE, SET_TC_OFFSET, SET_MAX_POWER, SET_KP, SET_KI,
+    SET_TC_SCALE, SET_MAX_POWER, SET_KP, SET_KI,
     SET_KD, SET_MAX_I, SET_CAL_FOLDER, SET_CAL_WIZARD, SET_SAVE
 };
 static const uint8_t s_display_items[] = {SET_BACKLIGHT, SET_ORIENTATION};
@@ -140,15 +144,17 @@ static uint8_t selected_setting(void)
     return s_settings_selected < group->count ? group->items[s_settings_selected] : SETTINGS_ITEM_COUNT;
 }
 
-static bool landscape(void) { return s_orientation >= ST7735_ORIENTATION_LANDSCAPE; }
-static uint16_t screen_width(void) { return landscape() ? 160U : 128U; }
-static uint16_t screen_height(void) { return landscape() ? 128U : 160U; }
-static uint8_t visible_menu_rows(void) { return landscape() ? 7U : SETTINGS_VISIBLE_ROWS; }
+static bool landscape(void) { return true; }
+static uint16_t screen_width(void) { return 160U; }
+static uint16_t screen_height(void) { return 128U; }
+static uint8_t visible_menu_rows(void) { return 7U; }
 
 uint8_t ui_display_orientation(void) { return s_orientation; }
 
 bool ui_set_display_orientation(uint8_t orientation)
 {
+    if (orientation < ST7735_ORIENTATION_LANDSCAPE)
+        orientation = ST7735_ORIENTATION_LANDSCAPE;
     if (orientation > ST7735_ORIENTATION_LANDSCAPE_ROT180) return false;
     if (s_lcd != NULL && ST7735_SetOrientation(s_lcd, orientation) != ST7735_OK) {
         ST7735_SetOrientation(s_lcd, s_orientation);
@@ -175,7 +181,7 @@ static uint8_t profile_list_slot(uint8_t index)
 static uint8_t profile_view_count(void)
 {
     switch (s_profile_view) {
-    case PROFILE_VIEW_ROOT: return 5U;
+    case PROFILE_VIEW_ROOT: return 7U;
     case PROFILE_VIEW_CREATE_TIP: case PROFILE_VIEW_MANAGE_TIP:
         return (uint8_t)(profile_count() + 1U);
     case PROFILE_VIEW_CREATE_FINISH: return 3U;
@@ -187,7 +193,7 @@ static uint8_t profile_view_count(void)
     }
     case PROFILE_VIEW_ACTION: return 4U;
     case PROFILE_VIEW_REMOVE: return 2U;
-    case PROFILE_VIEW_CAL_VALUES: return PROFILE_CAL_POINT_COUNT + 1U;
+    case PROFILE_VIEW_CAL_VALUES: return CAL_WIZARD_POINT_COUNT + 1U;
     default: return 1U;
     }
 }
@@ -245,9 +251,13 @@ static void profile_press_menu(void)
         if (selected == 0U) {
             control_select_profile(profile_active_index());
             board_buzzer_pattern(settings_save() ? 2U : 3U);
-        } else if (selected == 1U) profile_open(PROFILE_VIEW_CREATE_TIP);
-        else if (selected == 2U) profile_open(PROFILE_VIEW_MANAGE_TIP);
-        else if (selected == 3U) profile_open(PROFILE_VIEW_DETAILS);
+        } else if (selected == 1U) {
+            if (!s_settings_editing) control_long_press();
+            s_settings_editing = !s_settings_editing;
+        } else if (selected == 2U) profile_open(PROFILE_VIEW_CREATE_TIP);
+        else if (selected == 3U) profile_open(PROFILE_VIEW_MANAGE_TIP);
+        else if (selected == 4U) profile_open(PROFILE_VIEW_DETAILS);
+        else if (selected == 5U) tip_setup_start_profile();
         else {
             s_settings_level = 0U;
             s_settings_selected = GROUP_PROFILES;
@@ -315,7 +325,7 @@ static void profile_press_menu(void)
         profile_open(PROFILE_VIEW_MANAGE_LIST);
         break;
     case PROFILE_VIEW_CAL_VALUES:
-        if (selected >= PROFILE_CAL_POINT_COUNT) {
+        if (selected >= CAL_WIZARD_POINT_COUNT) {
             profile_open(PROFILE_VIEW_DETAILS);
         } else {
             if (s_settings_editing) board_buzzer_pattern(settings_save() ? 2U : 3U);
@@ -332,7 +342,28 @@ static const int16_t s_calibration_anchors[PROFILE_CAL_POINT_COUNT] =
 static void calibration_target(void)
 {
     control_set_target_c(profile_calibrate_temperature(
-        s_calibration_anchors[s_calibration_point]));
+        s_calibration_anchors[s_calibration_wizard_indices[s_calibration_point]]));
+}
+
+static void calibration_prepare_values(void)
+{
+    int16_t *v = s_calibration_values;
+    if (v[1] < 101) v[1] = 101;
+    if (v[1] > 497) v[1] = 497;
+    if (v[2] <= v[1]) v[2] = v[1] + 1;
+    if (v[2] > 498) v[2] = 498;
+    if (v[4] < v[2] + 2) v[4] = v[2] + 2;
+    if (v[4] > 500) v[4] = 500;
+}
+
+static void calibration_derive_curve(void)
+{
+    int16_t *v = s_calibration_values;
+    /* Preserve the six-anchor flash format. Hold endpoint corrections and
+     * interpolate 350 C between the measured 300 C and 400 C points. */
+    v[0] = v[1] - 100;
+    v[3] = v[2] + (v[4] - v[2]) / 2;
+    v[5] = v[4] + 50;
 }
 
 static void calibration_abort(void)
@@ -340,6 +371,8 @@ static void calibration_abort(void)
     control_long_press();
     if (s_calibration_save_failed) {
         profile_set_calibration_values(s_calibration_original);
+        profile_set_sixpoint_complete(s_calibration_original_verified);
+        profile_custom_commit();
         measure_profile_changed();
     }
     if (s_calibration_active) control_set_target_c(s_calibration_previous_target);
@@ -399,6 +432,11 @@ static void textbox(uint16_t x, uint16_t y, uint16_t width, const char *value,
 {
     textbox_advance(x, y, width, value, fg, bg, scale, 6U);
 }
+void ui_draw_setup_text(uint16_t y, const char *value, uint16_t color)
+{
+    textbox(3U, y, 154U, value, color, COLOR_BLACK, 1U);
+}
+void ui_force_redraw(void) { s_static_dirty = true; }
 
 static void field(uint8_t id, uint16_t x, uint16_t y, uint16_t width,
                   const char *value, uint16_t color, uint8_t scale)
@@ -585,7 +623,6 @@ static void draw_static(void)
     s_set_boost_delta_cache = -1;
     for (uint8_t i = 0; i < 3U; ++i) s_preset_value_cache[i] = UINT16_MAX;
     if (s_page == 0U) {
-        if (landscape()) {
             textbox(3, 3, 90, "OpenStation", COLOR_CYAN, COLOR_BLACK, 1);
             textbox(122, 3, 36, STATION_FW_VERSION, COLOR_CYAN, COLOR_BLACK, 1);
             ST7735_DrawHLine(s_lcd, 0, 16, 160, COLOR_CYAN);
@@ -609,42 +646,9 @@ static void draw_static(void)
             textbox(71, 77, 30, "Duty", COLOR_WHITE, COLOR_BLACK, 1);
             ST7735_DrawHLine(s_lcd, 0, 87, 160, COLOR_CYAN);
             s_duty_bar_fill = UINT8_MAX;
-        } else {
-        textbox(2, 2, 90, "OpenStation", COLOR_CYAN, COLOR_BLACK, 1);
-        textbox(92, 2, 36, STATION_FW_VERSION, COLOR_CYAN, COLOR_BLACK, 1);
-        ST7735_DrawHLine(s_lcd, 0, 14, 128, COLOR_CYAN);
-
-        textbox(3, 19, 70, "Set", COLOR_WHITE, COLOR_BLACK, 1);
-        degree_mark(58, 34, COLOR_WHITE);
-        textbox(63, 35, 12, "C", COLOR_WHITE, COLOR_BLACK, 2);
-        textbox(3, 59, 70, "Actual temp", COLOR_YELLOW, COLOR_BLACK, 1);
-        degree_mark(58, 74, COLOR_YELLOW);
-        textbox(63, 75, 12, "C", COLOR_YELLOW, COLOR_BLACK, 2);
-
-        ST7735_DrawHLine(s_lcd, 94, 17, 34, COLOR_WHITE);
-        ST7735_DrawHLine(s_lcd, 94, 30, 34, COLOR_WHITE);
-        ST7735_DrawHLine(s_lcd, 94, 43, 34, COLOR_WHITE);
-        ST7735_DrawHLine(s_lcd, 94, 56, 34, COLOR_WHITE);
-        ST7735_DrawVLine(s_lcd, 94, 17, 40, COLOR_WHITE);
-        ST7735_DrawVLine(s_lcd, 127, 17, 40, COLOR_WHITE);
-
-        ST7735_DrawHLine(s_lcd, 88, 65, 40, COLOR_WHITE);
-        ST7735_DrawHLine(s_lcd, 88, 87, 40, COLOR_WHITE);
-        ST7735_DrawVLine(s_lcd, 88, 65, 23, COLOR_WHITE);
-        ST7735_DrawVLine(s_lcd, 127, 65, 23, COLOR_WHITE);
-
-        textbox(3, 101, 25, "Duty", COLOR_WHITE, COLOR_BLACK, 1);
-        ST7735_DrawHLine(s_lcd, DUTY_BAR_X, DUTY_BAR_Y, DUTY_BAR_W, COLOR_WHITE);
-        ST7735_DrawHLine(s_lcd, DUTY_BAR_X, DUTY_BAR_Y + DUTY_BAR_H - 1U,
-                         DUTY_BAR_W, COLOR_WHITE);
-        ST7735_DrawVLine(s_lcd, DUTY_BAR_X, DUTY_BAR_Y, DUTY_BAR_H, COLOR_WHITE);
-        ST7735_DrawVLine(s_lcd, DUTY_BAR_X + DUTY_BAR_W - 1U, DUTY_BAR_Y,
-                         DUTY_BAR_H, COLOR_WHITE);
-        s_duty_bar_fill = UINT8_MAX;
-        }
     } else if (s_calibration_active) {
         ST7735_FillRect(s_lcd, 0, 0, screen_width(), 18, 0x1082);
-        textbox(3, 5, 118, "TEMP CALIBRATION", COLOR_WHITE, 0x1082, 1);
+        textbox(3, 5, 118, "3-POINT CALIBRATION", COLOR_WHITE, 0x1082, 1);
     } else {
         ST7735_DrawHLine(s_lcd, 0, 17, screen_width(), COLOR_GREEN);
         const char *heading = s_settings_level == 0U ? "SETTINGS" :
@@ -659,7 +663,7 @@ static void draw_static(void)
             case PROFILE_VIEW_ACTION: heading = "MANAGE PROFILE"; break;
             case PROFILE_VIEW_REMOVE: heading = "REMOVE PROFILE?"; break;
             case PROFILE_VIEW_DETAILS: heading = profile_active_name(); break;
-            case PROFILE_VIEW_CAL_VALUES: heading = "6-POINT VALUES"; break;
+            case PROFILE_VIEW_CAL_VALUES: heading = "3-POINT VALUES"; break;
             default: heading = "PROFILES"; break;
             }
         }
@@ -667,9 +671,9 @@ static void draw_static(void)
         if (s_settings_level != 0U && s_settings_group == GROUP_PROFILES &&
             s_profile_view == PROFILE_VIEW_ROOT) {
             ST7735_DrawHLine(s_lcd, 3, 21, screen_width() - 6U, COLOR_GREEN);
-            ST7735_DrawHLine(s_lcd, 3, 55, screen_width() - 6U, COLOR_GREEN);
-            ST7735_DrawVLine(s_lcd, 3, 21, 35, COLOR_GREEN);
-            ST7735_DrawVLine(s_lcd, screen_width() - 4U, 21, 35, COLOR_GREEN);
+            ST7735_DrawHLine(s_lcd, 3, 44, screen_width() - 6U, COLOR_GREEN);
+            ST7735_DrawVLine(s_lcd, 3, 21, 24, COLOR_GREEN);
+            ST7735_DrawVLine(s_lcd, screen_width() - 4U, 21, 24, COLOR_GREEN);
             textbox(8, 25, 118, "CURRENT PROFILE", COLOR_CYAN, COLOR_BLACK, 1);
         }
         s_menu_frame_row = UINT8_MAX;
@@ -693,7 +697,9 @@ void ui_init(ST7735_Object_t *lcd)
     s_calibration_error = NULL;
     s_profile_view = PROFILE_VIEW_ROOT;
     s_about_visible = false;
-    s_boot_warning_visible = settings_tip_warning_enabled();
+    /* The first-boot wizard already confirms the tip. Do not leave a boot
+     * warning hidden underneath it after the setup result is saved. */
+    s_boot_warning_visible = settings_setup_complete() && settings_tip_warning_enabled();
     s_boot_warning_dirty = s_boot_warning_visible;
     cache_invalidate();
 }
@@ -718,20 +724,37 @@ void ui_settings_rotate(int8_t detents)
     if (s_calibration_warning_visible) return;
     if (s_calibration_active) {
         uint8_t point = s_calibration_point;
-        int32_t value = (int32_t)s_calibration_values[point] + detents;
-        int16_t minimum = point == 0U ? 0 : s_calibration_values[point - 1U] + 1;
-        int16_t maximum = (int16_t)(550 - (PROFILE_CAL_POINT_COUNT - point - 1U));
+        uint8_t index = s_calibration_wizard_indices[point];
+        int32_t value = (int32_t)s_calibration_values[index] + detents;
+        int16_t minimum = point == 0U ? 101 :
+            (int16_t)(s_calibration_values[s_calibration_wizard_indices[point - 1U]] +
+                      (point == 2U ? 2 : 1));
+        int16_t maximum = point == 0U ? 497 : (point == 1U ? 498 : 500);
         if (value < minimum) value = minimum;
         if (value > maximum) value = maximum;
-        s_calibration_values[point] = (int16_t)value;
-        for (uint8_t i = point + 1U; i < PROFILE_CAL_POINT_COUNT; ++i)
-            if (s_calibration_values[i] <= s_calibration_values[i - 1U])
-                s_calibration_values[i] = s_calibration_values[i - 1U] + 1;
+        s_calibration_values[index] = (int16_t)value;
+        for (uint8_t i = point + 1U; i < CAL_WIZARD_POINT_COUNT; ++i) {
+            uint8_t next = s_calibration_wizard_indices[i];
+            int16_t required = (int16_t)(
+                s_calibration_values[s_calibration_wizard_indices[i - 1U]] +
+                (i == 2U ? 2 : 1));
+            if (s_calibration_values[next] < required)
+                s_calibration_values[next] = required;
+        }
         s_calibration_error = NULL;
         return;
     }
     if (s_settings_level != 0U && s_settings_group == GROUP_PROFILES &&
         s_profile_view != PROFILE_VIEW_DETAILS) {
+        if (s_profile_view == PROFILE_VIEW_ROOT && s_settings_editing &&
+            s_settings_selected == 1U) {
+            int16_t room = (int16_t)settings_room_temperature_c() + detents;
+            if (room < 0) room = 0;
+            if (room > 50) room = 50;
+            settings_set_room_temperature_c((uint8_t)room);
+            measure_profile_changed();
+            return;
+        }
         if (s_profile_view == PROFILE_VIEW_NAME) {
             static const char glyphs[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
             char current = s_name[s_name_cursor];
@@ -749,9 +772,23 @@ void ui_settings_rotate(int8_t detents)
         if (s_profile_view == PROFILE_VIEW_CAL_VALUES && s_settings_editing) {
             const tip_profile_t *p = profile_active();
             uint8_t point = s_settings_selected;
-            if (point < PROFILE_CAL_POINT_COUNT) {
-                profile_set_calibration(point, (int16_t)(p->temp_cal_c[point] + detents));
-                measure_profile_changed();
+            if (point < CAL_WIZARD_POINT_COUNT) {
+                int16_t values[PROFILE_CAL_POINT_COUNT];
+                memcpy(values, p->temp_cal_c, sizeof(values));
+                uint8_t index = s_calibration_wizard_indices[point];
+                int32_t next = (int32_t)values[index] + detents;
+                int16_t minimum = point == 0U ? 101 :
+                    (int16_t)(values[s_calibration_wizard_indices[point - 1U]] + 1);
+                int16_t maximum = point == 2U ? 500 :
+                    (int16_t)(values[s_calibration_wizard_indices[point + 1U]] -
+                              (point == 1U ? 2 : 1));
+                if (next < minimum) next = minimum;
+                if (next > maximum) next = maximum;
+                values[index] = (int16_t)next;
+                values[0] = values[1] - 100;
+                values[3] = values[2] + (values[4] - values[2]) / 2;
+                values[5] = values[4] + 50;
+                if (profile_set_calibration_values(values)) measure_profile_changed();
             }
             return;
         }
@@ -789,13 +826,8 @@ void ui_settings_rotate(int8_t detents)
                              (uint16_t)(value < 150 ? 150 : value));
         break;
     case SET_TC_SCALE:
-        value = (int32_t)p->temp_uv_per_c + (int32_t)detents * 50;
-        profile_set_temp_uv_per_c((uint16_t)(value < 0 ? 0 : value));
-        measure_profile_changed();
-        break;
-    case SET_TC_OFFSET:
-        value = (int32_t)p->temp_offset_c + detents;
-        profile_set_temp_offset_c((int16_t)value);
+        value = (int32_t)profile_sensitivity_tenths() + detents;
+        profile_set_sensitivity_tenths((uint16_t)(value < 0 ? 0 : value));
         measure_profile_changed();
         break;
     case SET_PROFILE_DEFAULT_TEMP:
@@ -888,10 +920,9 @@ void ui_settings_rotate(int8_t detents)
         board_backlight_set((uint8_t)value);
         break;
     case SET_ORIENTATION: {
-        int16_t next = (int16_t)s_orientation + detents;
-        while (next < 0) next += 4;
-        while (next >= 4) next -= 4;
-        ui_set_display_orientation((uint8_t)next);
+        if (detents & 1) ui_set_display_orientation(
+            s_orientation == ST7735_ORIENTATION_LANDSCAPE ?
+            ST7735_ORIENTATION_LANDSCAPE_ROT180 : ST7735_ORIENTATION_LANDSCAPE);
         s_settings_scroll = 0U;
         break;
     }
@@ -929,17 +960,21 @@ void ui_settings_press(void)
     if (s_calibration_warning_visible) {
         const measurement_t *m = measure_get();
         const tip_profile_t *p = profile_active();
+        int16_t highest_target = profile_calibrate_temperature(400);
         if (!m->tip_present || !m->quiet_sample_valid) {
             s_calibration_error = "CONNECT TIP FIRST";
         } else if (safety_latched()) {
             s_calibration_error = "CLEAR FAULT FIRST";
         } else if (control_get()->stand_active) {
             s_calibration_error = "REMOVE FROM STAND";
-        } else if (control_max_target_c() < 450U || p->maximum_temp_c < 450) {
-            s_calibration_error = "SET MAX TO 450C";
+        } else if (control_max_target_c() < (uint16_t)highest_target ||
+                   p->maximum_temp_c < highest_target) {
+            s_calibration_error = "MAX BELOW CAL TARGET";
         } else {
             memcpy(s_calibration_original, p->temp_cal_c, sizeof(s_calibration_original));
+            s_calibration_original_verified = profile_above_300_verified();
             memcpy(s_calibration_values, p->temp_cal_c, sizeof(s_calibration_values));
+            calibration_prepare_values();
             s_calibration_previous_target = control_get()->target_c;
             s_calibration_warning_visible = false;
             s_calibration_active = true;
@@ -962,7 +997,7 @@ void ui_settings_press(void)
     if (s_calibration_active) {
         const measurement_t *m = measure_get();
         int16_t difference = m->temperature_base_c -
-                             s_calibration_anchors[s_calibration_point];
+            s_calibration_anchors[s_calibration_wizard_indices[s_calibration_point]];
         if (difference < 0) difference = -difference;
         if (!s_calibration_save_failed &&
             (!m->tip_present || !m->quiet_sample_valid ||
@@ -974,24 +1009,29 @@ void ui_settings_press(void)
             return;
         }
         s_calibration_error = NULL;
-        if (s_calibration_point + 1U < PROFILE_CAL_POINT_COUNT) {
+        if (s_calibration_point + 1U < CAL_WIZARD_POINT_COUNT) {
             ++s_calibration_point;
             s_calibration_stable_since_ms = 0U;
             calibration_target();
         } else {
             control_long_press();
+            calibration_derive_curve();
             if (!profile_set_calibration_values(s_calibration_values)) {
-                s_calibration_error = "INVALID 6 VALUES";
-            } else if (!settings_save()) {
-                s_calibration_save_failed = true;
-                s_calibration_error = "SAVE FAILED - RETRY";
+                s_calibration_error = "INVALID 3 VALUES";
             } else {
-                s_calibration_save_failed = false;
-                measure_profile_changed();
-                control_set_target_c(s_calibration_previous_target);
-                s_calibration_active = false;
-                profile_open(PROFILE_VIEW_CAL_VALUES);
-                board_buzzer_pattern(2U);
+                profile_mark_sixpoint_complete();
+                if (!settings_save()) {
+                    profile_set_sixpoint_complete(s_calibration_original_verified);
+                    s_calibration_save_failed = true;
+                    s_calibration_error = "SAVE FAILED - RETRY";
+                } else {
+                    s_calibration_save_failed = false;
+                    measure_profile_changed();
+                    control_set_target_c(s_calibration_previous_target);
+                    s_calibration_active = false;
+                    profile_open(PROFILE_VIEW_CAL_VALUES);
+                    board_buzzer_pattern(2U);
+                }
             }
         }
         s_static_dirty = true;
@@ -1061,7 +1101,9 @@ void ui_settings_press(void)
         measure_profile_changed();
         control_reconfigure();
         bool erased = profiles_custom_clear_all();
-        board_buzzer_pattern(erased && settings_save() ? 2U : 3U);
+        bool saved = erased && settings_save();
+        board_buzzer_pattern(saved ? 2U : 3U);
+        if (saved) tip_setup_init(s_lcd);
         s_settings_editing = false;
         s_static_dirty = true;
         return;
@@ -1114,7 +1156,7 @@ static void draw_boot_tip_warning(void)
 {
     char b[UI_TEXT_MAX + 1U];
     ST7735_FillScreen(s_lcd, COLOR_BLACK);
-    if (landscape()) {
+
         ST7735_DrawHLine(s_lcd, 4, 15, 152, COLOR_ORANGE);
         textbox(5, 4, 120, "CHECK TIP", COLOR_ORANGE, COLOR_BLACK, 1);
         snprintf(b, sizeof(b), "PROFILE: %s", profile_active_name());
@@ -1124,20 +1166,7 @@ static void draw_boot_tip_warning(void)
         textbox(7, 83, 128, "CHANGE IN SETTINGS", COLOR_CYAN, COLOR_BLACK, 1);
         textbox(7, 110, 128, "CLICK TO CLOSE", COLOR_GREEN, COLOR_BLACK, 1);
         s_boot_warning_dirty = false;
-        return;
-    }
-    ST7735_DrawHLine(s_lcd, 4, 22, 120, COLOR_ORANGE);
-    ST7735_DrawHLine(s_lcd, 4, 145, 120, COLOR_ORANGE);
-    ST7735_DrawVLine(s_lcd, 4, 22, 124, COLOR_ORANGE);
-    ST7735_DrawVLine(s_lcd, 123, 22, 124, COLOR_ORANGE);
-    textbox(10, 29, 108, "CHECK TIP", COLOR_ORANGE, COLOR_BLACK, 2);
-    snprintf(b, sizeof(b), "TIP: %s", profile_active_name());
-    textbox(10, 59, 108, b, COLOR_YELLOW, COLOR_BLACK, 1);
-    textbox(10, 77, 108, "VERIFY IRON TIP", COLOR_WHITE, COLOR_BLACK, 1);
-    textbox(10, 90, 108, "MATCHES PROFILE", COLOR_WHITE, COLOR_BLACK, 1);
-    textbox(10, 111, 108, "CHANGE IN SETTINGS", COLOR_CYAN, COLOR_BLACK, 1);
-    textbox(10, 134, 108, "CLICK TO CLOSE", COLOR_GREEN, COLOR_BLACK, 1);
-    s_boot_warning_dirty = false;
+
 }
 
 static const char *fault_detail(safety_fault_t fault)
@@ -1162,7 +1191,7 @@ static void draw_fault_popup(void)
 {
     char b[UI_TEXT_MAX + 1U];
     const fault_snapshot_t *snap = safety_snapshot();
-    if (landscape()) {
+
         ST7735_FillScreen(s_lcd, COLOR_BLACK);
         ST7735_DrawHLine(s_lcd, 4, 15, 152, COLOR_RED);
         textbox(6, 3, 110, "FAULT", COLOR_RED, COLOR_BLACK, 1);
@@ -1180,57 +1209,18 @@ static void draw_fault_popup(void)
         }
         textbox(6, 111, 128, "CLICK TO CLOSE", COLOR_GREEN, COLOR_BLACK, 1);
         s_fault_popup_dirty = false;
-        return;
-    }
-    ST7735_FillRect(s_lcd, 4, 22, 120, 124, COLOR_BLACK);
-    ST7735_DrawHLine(s_lcd, 4, 22, 120, COLOR_RED);
-    ST7735_DrawHLine(s_lcd, 4, 145, 120, COLOR_RED);
-    ST7735_DrawVLine(s_lcd, 4, 22, 124, COLOR_RED);
-    ST7735_DrawVLine(s_lcd, 123, 22, 124, COLOR_RED);
-    textbox(10, 29, 108, "FAULT", COLOR_RED, COLOR_BLACK, 2);
-    textbox(10, 49, 108, safety_fault_text(s_popup_fault), COLOR_YELLOW, COLOR_BLACK, 1);
-    if (s_popup_fault == FAULT_SUPPLY_RANGE) {
-        snprintf(b, sizeof(b), "SAFE %u-%uV FOR TIP",
-                 profile_supply_min_mv() / 1000U, profile_supply_max_mv() / 1000U);
-        textbox(10, 62, 108, b, COLOR_WHITE, COLOR_BLACK, 1);
-    } else textbox(10, 62, 108, fault_detail(s_popup_fault),
-                   COLOR_WHITE, COLOR_BLACK, 1);
-    snprintf(b, sizeof(b), "VIN: %lu.%02lu V",
-             (unsigned long)(snap->vin_mv / 1000UL),
-             (unsigned long)((snap->vin_mv / 10UL) % 100UL));
-    textbox(10, 80, 108, b, COLOR_CYAN, COLOR_BLACK, 1);
-    if (s_popup_fault == FAULT_SENSOR_UNSTABLE)
-        snprintf(b, sizeof(b), "FROM:%dC PA1:%u", snap->reference_temperature_c,
-                 snap->reference_temp_raw);
-    else
-        snprintf(b, sizeof(b), "T:%dC PA1:%u", snap->temperature_c, snap->temp_raw);
-    textbox(10, 93, 108, b, COLOR_CYAN, COLOR_BLACK, 1);
-    if (s_popup_fault == FAULT_SENSOR_UNSTABLE)
-        snprintf(b, sizeof(b), "NOW:%dC PA1:%u", snap->temperature_c, snap->temp_raw);
-    else if (s_popup_fault == FAULT_OFF_CURRENT)
-        snprintf(b, sizeof(b), "OFF:%u.%uA PA6:%u", snap->current_ma / 1000U,
-                 (snap->current_ma / 100U) % 10U, snap->current_raw);
-    else
-        snprintf(b, sizeof(b), "CUR:%u.%uA DUT:%u.%u%%", snap->current_ma / 1000U,
-                 (snap->current_ma / 100U) % 10U, snap->duty_permille / 10U,
-                 snap->duty_permille % 10U);
-    textbox(10, 106, 108, b, COLOR_CYAN, COLOR_BLACK, 1);
-    snprintf(b, sizeof(b), "TIME:%lu.%01lus", (unsigned long)(snap->timestamp_ms / 1000UL),
-             (unsigned long)((snap->timestamp_ms / 100UL) % 10UL));
-    textbox(10, 119, 108, b, COLOR_GRAY, COLOR_BLACK, 1);
-    textbox(10, 134, 108, "CLICK TO CLOSE", COLOR_GREEN, COLOR_BLACK, 1);
-    s_fault_popup_dirty = false;
+
 }
 
 static void draw_about(void)
 {
     char b[32];
     ST7735_FillScreen(s_lcd, COLOR_BLACK);
-    if (landscape()) {
+
         textbox(6, 5, 110, "OpenStation", COLOR_CYAN, COLOR_BLACK, 1);
         ST7735_DrawHLine(s_lcd, 0, 18, 160, COLOR_CYAN);
-        snprintf(b, sizeof(b), "Version %s Build %u",
-                 STATION_FW_VERSION, STATION_FW_BUILD);
+        snprintf(b, sizeof(b), "Version %s Build %u%s",
+                 STATION_FW_VERSION, STATION_FW_BUILD, STATION_FW_BUILD_SUFFIX);
         textbox(6, 23, 145, b, COLOR_WHITE, COLOR_BLACK, 1);
         textbox(6, 36, 145, "Board hardware by", COLOR_WHITE, COLOR_BLACK, 1);
         textbox(6, 49, 145, "toanthodien16", COLOR_GREEN, COLOR_BLACK, 1);
@@ -1245,30 +1235,13 @@ static void draw_about(void)
         textbox(16, 112, 132, "Click or hold to exit",
                 COLOR_YELLOW, COLOR_BLACK, 1);
         s_static_dirty = false;
-        return;
-    }
-    textbox(6, 5, 118, "OpenStation", COLOR_CYAN, COLOR_BLACK, 1);
-    ST7735_DrawHLine(s_lcd, 0, 18, 128, COLOR_CYAN);
-    snprintf(b, sizeof(b), "Version %s", STATION_FW_VERSION);
-    textbox(6, 24, 118, b, COLOR_WHITE, COLOR_BLACK, 1);
-    snprintf(b, sizeof(b), "Build %u", STATION_FW_BUILD);
-    textbox(6, 37, 118, b, COLOR_WHITE, COLOR_BLACK, 1);
-    textbox(6, 52, 118, "Board hardware by", COLOR_WHITE, COLOR_BLACK, 1);
-    textbox(6, 65, 118, "toanthodien16", COLOR_GREEN, COLOR_BLACK, 1);
-    ST7735_DrawHLine(s_lcd, 0, 79, 128, COLOR_CYAN);
-    textbox(6, 84, 118, "Firmware brought to", COLOR_WHITE, COLOR_BLACK, 1);
-    textbox(6, 97, 42, "you by ", COLOR_WHITE, COLOR_BLACK, 1);
-    textbox(48, 97, 48, "dolce_st", COLOR_YELLOW, COLOR_BLACK, 1);
-    textbox(6, 110, 122, "with help of ChatGPT", COLOR_WHITE, COLOR_BLACK, 1);
-    textbox(6, 123, 118, "github.com/imdolce", COLOR_WHITE, COLOR_BLACK, 1);
-    textbox(6, 146, 118, "Click/hold to exit", COLOR_YELLOW, COLOR_BLACK, 1);
-    s_static_dirty = false;
+
 }
 
 static void draw_calibration_warning(void)
 {
     ST7735_FillScreen(s_lcd, COLOR_BLACK);
-    if (landscape()) {
+
         textbox(5, 3, 125, "CALIBRATION WARNING", COLOR_RED, COLOR_BLACK, 1);
         ST7735_DrawHLine(s_lcd, 3, 15, 154, COLOR_RED);
         textbox(7, 23, 128, "TIP MAY GET HOTTER", COLOR_YELLOW, COLOR_BLACK, 1);
@@ -1281,27 +1254,18 @@ static void draw_calibration_warning(void)
                 "CLICK TO PROCEED", s_calibration_error != NULL ? COLOR_RED : COLOR_GREEN,
                 COLOR_BLACK, 1);
         s_calibration_warning_dirty = false;
-        return;
-    }
-    ST7735_DrawHLine(s_lcd, 3, 16, 122, COLOR_RED);
-    textbox(5, 5, 118, "CALIBRATION WARNING", COLOR_RED, COLOR_BLACK, 1);
-    textbox(7, 29, 114, "TIP MAY GET HOTTER", COLOR_YELLOW, COLOR_BLACK, 1);
-    textbox(7, 43, 114, "THAN REQUIRED TEMP", COLOR_YELLOW, COLOR_BLACK, 1);
-    textbox(7, 61, 114, "THERMAL RUNAWAY", COLOR_RED, COLOR_BLACK, 1);
-    textbox(7, 76, 114, "IS POSSIBLE", COLOR_RED, COLOR_BLACK, 1);
-    textbox(7, 96, 114, "CUT POWER IF NEEDED", COLOR_WHITE, COLOR_BLACK, 1);
-    textbox(7, 114, 114, "LONG: CUT AND EXIT", COLOR_WHITE, COLOR_BLACK, 1);
-    textbox(7, 140, 114, s_calibration_error != NULL ? s_calibration_error :
-            "CLICK TO PROCEED", s_calibration_error != NULL ? COLOR_RED : COLOR_GREEN,
-            COLOR_BLACK, 1);
-    s_calibration_warning_dirty = false;
+
 }
 
 static void render_profile_menu(void)
 {
     char b[UI_TEXT_MAX + 1U];
     if (s_profile_view == PROFILE_VIEW_ROOT) {
-        field(13, 8, 40, 118, profile_active_name(), COLOR_WHITE, 1);
+        if (profile_active_is_custom())
+            snprintf(b, sizeof(b), "%s", profile_active_name());
+        else
+            snprintf(b, sizeof(b), "%s default", profile_active_name());
+        field(13, 8, 36, 118, b, COLOR_WHITE, 1);
     }
     if (s_profile_view == PROFILE_VIEW_NAME) {
         snprintf(b, sizeof(b), "TIP: %s", profile_get(s_profile_family)->name);
@@ -1323,7 +1287,7 @@ static void render_profile_menu(void)
         return;
     }
     uint8_t count = profile_view_count();
-    uint8_t visible_rows = s_profile_view == PROFILE_VIEW_ROOT ? 5U : visible_menu_rows();
+    uint8_t visible_rows = s_profile_view == PROFILE_VIEW_ROOT ? 7U : visible_menu_rows();
     for (uint8_t row = 0; row < visible_rows; ++row) {
         uint8_t index = (uint8_t)(s_settings_scroll + row);
         const char *label = NULL;
@@ -1332,9 +1296,12 @@ static void render_profile_menu(void)
             switch (s_profile_view) {
             case PROFILE_VIEW_ROOT:
                 if (index == 0U) snprintf(b, sizeof(b), "DEFAULT %s", profile_get(profile_active_index())->name);
+                else if (index == 1U)
+                    snprintf(b, sizeof(b), "ROOM TEMP %uC", settings_room_temperature_c());
                 else {
                     static const char *const options[] = {
-                        "", "CREATE NEW", "MANAGE PROFILES", "VIEW DETAILS", "BACK"
+                        "", "", "CREATE NEW", "MANAGE PROFILES", "VIEW DETAILS",
+                        "TIP SETUP", "BACK"
                     };
                     label = options[index];
                 }
@@ -1365,9 +1332,11 @@ static void render_profile_menu(void)
                 label = index == 0U ? "YES, REMOVE" : "NO, BACK";
                 break;
             case PROFILE_VIEW_CAL_VALUES:
-                if (index < PROFILE_CAL_POINT_COUNT)
-                    snprintf(b, sizeof(b), "%3dC  %3dC", s_calibration_anchors[index],
-                             profile_active()->temp_cal_c[index]);
+                if (index < CAL_WIZARD_POINT_COUNT) {
+                    uint8_t point = s_calibration_wizard_indices[index];
+                    snprintf(b, sizeof(b), "%3dC  %3dC", s_calibration_anchors[point],
+                             profile_active()->temp_cal_c[point]);
+                }
                 else label = "BACK";
                 break;
             default: break;
@@ -1377,21 +1346,22 @@ static void render_profile_menu(void)
         char line[UI_TEXT_MAX + 1U];
         snprintf(line, sizeof(line), "%c %.20s", index == s_settings_selected ?
                  (s_settings_editing ? '*' : '>') : ' ', b);
-        uint16_t menu_y = s_profile_view == PROFILE_VIEW_ROOT ? 62U : 24U;
-        field(row, 1, (uint16_t)(menu_y + row * 14U), 126, line,
+        uint16_t menu_y = s_profile_view == PROFILE_VIEW_ROOT ? 48U : 24U;
+        uint16_t stride = s_profile_view == PROFILE_VIEW_ROOT ? 11U : 14U;
+        field(row, 1, (uint16_t)(menu_y + row * stride), 126, line,
               index == s_settings_selected ?
               (s_settings_editing ? COLOR_ORANGE : COLOR_YELLOW) : COLOR_WHITE, 1);
     }
     uint8_t frame_row = (uint8_t)(s_settings_selected - s_settings_scroll);
     if (frame_row != s_menu_frame_row) {
         if (s_menu_frame_row < visible_rows) {
-            uint16_t old = (uint16_t)((s_profile_view == PROFILE_VIEW_ROOT ? 60U : 22U) +
-                                      s_menu_frame_row * 14U);
+            uint16_t old = (uint16_t)((s_profile_view == PROFILE_VIEW_ROOT ? 46U : 22U) +
+                                      s_menu_frame_row * (s_profile_view == PROFILE_VIEW_ROOT ? 11U : 14U));
             ST7735_DrawHLine(s_lcd, 0, old, screen_width(), COLOR_BLACK);
             ST7735_DrawHLine(s_lcd, 0, old + 11U, screen_width(), COLOR_BLACK);
         }
-        uint16_t y = (uint16_t)((s_profile_view == PROFILE_VIEW_ROOT ? 60U : 22U) +
-                                frame_row * 14U);
+        uint16_t y = (uint16_t)((s_profile_view == PROFILE_VIEW_ROOT ? 46U : 22U) +
+                                frame_row * (s_profile_view == PROFILE_VIEW_ROOT ? 11U : 14U));
         ST7735_DrawHLine(s_lcd, 0, y, screen_width(), COLOR_YELLOW);
         ST7735_DrawHLine(s_lcd, 0, y + 11U, screen_width(), COLOR_YELLOW);
         s_menu_frame_row = frame_row;
@@ -1461,7 +1431,6 @@ void ui_render(void)
     }
 
     if (s_page == 0U) {
-        if (landscape()) {
             if (m->tip_present) {
                 snprintf(b, sizeof(b), "%3d", m->temperature_c);
                 field(0, 3, 33, 36, b,
@@ -1481,9 +1450,16 @@ void ui_render(void)
                                   disabled);
             }
             main_status_update(c, m->tip_present);
-            snprintf(b, sizeof(b), "Tip: %s - %s", p->name, profile_active_name());
-            if (strlen(b) > 25U)
-                snprintf(b, sizeof(b), "Tip:%s %s", p->name, profile_active_name());
+            if (profile_active_is_custom()) {
+                snprintf(b, sizeof(b), "Tip: %s - %s", p->name, profile_active_name());
+                if (strlen(b) > 25U)
+                    snprintf(b, sizeof(b), "Tip:%s %s", p->name, profile_active_name());
+            } else {
+                if (strlen(p->name) <= 4U)
+                    snprintf(b, sizeof(b), "Tip: %.4s - %.4s Default", p->name, p->name);
+                else
+                    snprintf(b, sizeof(b), "Tip: %s Default", p->name);
+            }
             field(2, 3, 91, 154, b, COLOR_WHITE, 1);
             snprintf(b, sizeof(b), "%u%%", (pw->limited_permille + 5U) / 10U);
             field(3, 103, 77, 30, b, COLOR_WHITE, 1);
@@ -1522,59 +1498,10 @@ void ui_render(void)
                           (unsigned long)((pw->estimated_power_mw / 10UL) % 100UL));
             field(7, 84, 116, 74, b, COLOR_WHITE, 1);
             return;
-        }
-        set_boost_indicator_update(c);
-        snprintf(b, sizeof(b), "%3d",
-                 c->state == STATE_BOOST ? c->active_setpoint_c : c->target_c);
-        field(0, 2, 30, 54, b,
-              c->state == STATE_BOOST ? COLOR_RED : COLOR_WHITE, 3);
-        if (m->tip_present) {
-            snprintf(b, sizeof(b), "%3d", m->temperature_c);
-            field(1, 2, 70, 54, b,
-                  m->temperature_compensated ? COLOR_ORANGE : COLOR_YELLOW, 3);
-        } else {
-            field(1, 2, 70, 54, "---", COLOR_RED, 3);
-        }
-        field(11, 77, 78, 8, m->temperature_compensated ? "+" : "",
-              COLOR_ORANGE, 1);
-        for (uint8_t i = 0; i < 3U; ++i) {
-            uint16_t preset = control_preset_c(i);
-            bool disabled = preset > control_max_target_c() ||
-                            preset > (uint16_t)p->maximum_temp_c;
-            preset_row_update(i, preset, !disabled && control_selected_preset() == (int8_t)i,
-                              disabled);
-        }
-        main_status_update(c, m->tip_present);
-        uint32_t remaining_s;
-        if (sleep_countdown(c, &remaining_s) != 0U) {
-            snprintf(b, sizeof(b), "%02lu:%02lu",
-                     (unsigned long)(remaining_s / 60UL),
-                     (unsigned long)(remaining_s % 60UL));
-            field(12, 89, 91, 39, b, COLOR_CYAN, 1);
-        } else field(12, 89, 91, 39, safety_ignore_faults() ? "DBG" : "",
-                     COLOR_ORANGE, 1);
-        snprintf(b, sizeof(b), "%3u%%", (pw->limited_permille + 5U) / 10U);
-        field(6, 103, 101, 25, b, COLOR_WHITE, 1);
-        duty_bar_update(pw->limited_permille);
-        snprintf(b, sizeof(b), "Tip: %s", profile_active_name());
-        field(7, 3, 114, 125, b, COLOR_WHITE, 1);
-        snprintf(b, sizeof(b), "Voltage: %lu.%02lu V", (unsigned long)(m->vin_mv / 1000UL),
-                 (unsigned long)((m->vin_mv / 10UL) % 100UL));
-        field(8, 3, 125, 125, b, m->vin_valid ? COLOR_WHITE : COLOR_RED, 1);
-        if (pw->pulse_ticks != 0U && !pw->cycle_measurement_valid)
-            snprintf(b, sizeof(b), "Current: -- A");
-        else snprintf(b, sizeof(b), "Current: %u.%02u A", pw->average_current_ma / 1000U,
-                      (pw->average_current_ma / 10U) % 100U);
-        field(9, 3, 136, 125, b, COLOR_WHITE, 1);
-        if (pw->pulse_ticks != 0U && !pw->cycle_measurement_valid)
-            snprintf(b, sizeof(b), "Power: -- W");
-        else snprintf(b, sizeof(b), "Power: %lu.%02lu W",
-                      (unsigned long)(pw->estimated_power_mw / 1000UL),
-                      (unsigned long)((pw->estimated_power_mw / 10UL) % 100UL));
-        field(10, 3, 147, 125, b, COLOR_WHITE, 1);
     } else if (s_calibration_active) {
         uint8_t point = s_calibration_point;
-        int16_t difference = m->temperature_base_c - s_calibration_anchors[point];
+        int16_t difference = m->temperature_base_c -
+            s_calibration_anchors[s_calibration_wizard_indices[point]];
         if (difference < 0) difference = -difference;
         if (m->tip_present && m->quiet_sample_valid && c->heating_enabled &&
             !c->stand_active && !safety_latched() && difference <= 25 &&
@@ -1591,13 +1518,15 @@ void ui_render(void)
             quality = "READY";
             quality_color = COLOR_GREEN;
         }
-        snprintf(b, sizeof(b), "POINT %dC  %u/6", s_calibration_anchors[point], point + 1U);
+        snprintf(b, sizeof(b), "POINT %dC  %u/3",
+                 s_calibration_anchors[s_calibration_wizard_indices[point]], point + 1U);
         field(0, 4, landscape() ? 21U : 24U, 120, b, COLOR_YELLOW, 1);
         snprintf(b, sizeof(b), "HEAT TO %4dC", c->target_c);
         field(1, 4, landscape() ? 35U : 42U, 120, b, COLOR_WHITE, 1);
         snprintf(b, sizeof(b), "BASE TEMP %4dC", m->temperature_base_c);
         field(2, 4, landscape() ? 49U : 56U, 120, b, COLOR_CYAN, 1);
-        snprintf(b, sizeof(b), "EXTERNAL %4dC", s_calibration_values[point]);
+        snprintf(b, sizeof(b), "EXTERNAL %4dC",
+                 s_calibration_values[s_calibration_wizard_indices[point]]);
         field(3, 4, landscape() ? 63U : 72U, 120, b, COLOR_ORANGE, 1);
         snprintf(b, sizeof(b), "STATION  %4dC", m->temperature_c);
         field(4, 4, landscape() ? 77U : 88U, 120, b, COLOR_WHITE, 1);
@@ -1646,8 +1575,12 @@ void ui_render(void)
                 snprintf(b, sizeof(b), "%c PRESET %u  %3uC", lead,
                          i - SET_PRESET_1 + 1U, control_preset_c((uint8_t)(i - SET_PRESET_1)));
                 break;
-            case SET_TC_SCALE: snprintf(b, sizeof(b), "%c TC SCALE %5u", lead, p->temp_uv_per_c); break;
-            case SET_TC_OFFSET: snprintf(b, sizeof(b), "%c TC OFF   %+4dC", lead, p->temp_offset_c); break;
+            case SET_TC_SCALE: {
+                uint16_t tenths = profile_sensitivity_tenths();
+                snprintf(b, sizeof(b), "%c TC %2u.%u uV/C", lead,
+                         tenths / 10U, tenths % 10U);
+                break;
+            }
             case SET_PROFILE_DEFAULT_TEMP: snprintf(b, sizeof(b), "%c DEFAULT  %3dC", lead,
                                                     p->default_temp_c); break;
             case SET_PROFILE_MAX_TEMP: snprintf(b, sizeof(b), "%c TIP MAX  %3dC", lead,
@@ -1662,7 +1595,7 @@ void ui_render(void)
                 p->kd_q8 / 256U, ((p->kd_q8 % 256U) * 10U) / 256U); break;
             case SET_MAX_I: snprintf(b, sizeof(b), "%c MAX I    %4u", lead,
                                      p->max_integral_permille); break;
-            case SET_CAL_FOLDER: snprintf(b, sizeof(b), "%c 6-POINT VALUES >", lead); break;
+            case SET_CAL_FOLDER: snprintf(b, sizeof(b), "%c 3-POINT VALUES >", lead); break;
             case SET_SLEEP_TEMP: snprintf(b, sizeof(b), "%c SLEEP    %3dC", lead, p->sleep_temp_c); break;
             case SET_MAX_TEMP: snprintf(b, sizeof(b), "%c MAX TEMP %3uC", lead,
                                         control_max_target_c()); break;
@@ -1699,10 +1632,9 @@ void ui_render(void)
             case SET_BACKLIGHT: snprintf(b, sizeof(b), "%c LIGHT     %3u%%", lead,
                              board_backlight_get()); break;
             case SET_ORIENTATION: {
-                static const char *const names[] = {
-                    "PORTRAIT", "PORTRAIT 180", "LANDSCAPE", "LANDSCAPE 180"
-                };
-                snprintf(b, sizeof(b), "%c ORIENT %s", lead, names[s_orientation]);
+                snprintf(b, sizeof(b), "%c ORIENT %s", lead,
+                    s_orientation == ST7735_ORIENTATION_LANDSCAPE ?
+                    "LANDSCAPE" : "FLIPPED 180");
                 break;
             }
             case SET_BUZZER: snprintf(b, sizeof(b), "%c BUZZER     %s", lead,

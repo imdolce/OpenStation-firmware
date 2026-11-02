@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define PROFILE_CAL_POINT_COUNT 6U
+#define PROFILE_HARD_MAX_POWER_MW 800000UL
 #define PROFILE_CUSTOM_PER_TIP 10U
 #define PROFILE_CUSTOM_NAME_MAX 12U
 
@@ -31,6 +32,7 @@ typedef struct {
     int16_t sleep_temp_c;
     int16_t maximum_temp_c;
     uint8_t characterized;
+    uint8_t room_reference_c;
 } tip_profile_t;
 
 uint8_t profile_count(void);
@@ -42,7 +44,12 @@ uint16_t profile_supply_max_mv(void);
 bool profile_supply_in_range(uint32_t vin_mv);
 void profile_select(uint8_t index);
 void profile_set_temp_uv_per_c(uint16_t value);
-void profile_set_temp_offset_c(int16_t value);
+uint16_t profile_sensitivity_tenths(void);
+void profile_set_sensitivity_tenths(uint16_t value);
+bool profile_apply_tip_setup(const tip_profile_t *candidate);
+bool profile_above_300_verified(void);
+void profile_mark_sixpoint_complete(void);
+void profile_set_sixpoint_complete(bool complete);
 void profile_set_max_power_mw(uint32_t value);
 void profile_set_sleep_temp_c(int16_t value);
 void profile_set_default_temp_c(int16_t value);

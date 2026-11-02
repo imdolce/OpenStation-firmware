@@ -17,5 +17,7 @@ void ui_dismiss_boot_warning(void);
 void ui_render(void);
 uint8_t ui_display_orientation(void);
 bool ui_set_display_orientation(uint8_t orientation);
+void ui_draw_setup_text(uint16_t y, const char *value, uint16_t color);
+void ui_force_redraw(void);
 
 #endif

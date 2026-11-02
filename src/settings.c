@@ -14,7 +14,7 @@
 #include <string.h>
 
 #define SETTINGS_MAGIC        0x534C4452UL
-#define SETTINGS_VERSION      9U
+#define SETTINGS_VERSION      12U
 #define SETTINGS_FLASH_ADDR   0x0800F400UL
 #define SETTINGS_FLASH_BYTES  1024U
 #define SETTINGS_PROFILE_CAP  9U
@@ -97,6 +97,36 @@ typedef struct {
     uint8_t boost_delta_c;
     uint8_t boost_time_s;
     uint32_t checksum;
+} settings_record_v9_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version, size;
+    uint8_t active_profile, encoder_step_c, backlight_percent, buzzer_enabled;
+    uint8_t notification_flags, encoder_reversed, ignore_faults, drop_compensation_enabled;
+    uint32_t sleep_delay_ms;
+    tip_profile_t profiles[SETTINGS_PROFILE_CAP];
+    uint16_t presets_c[3], max_target_c, sleep_time_s;
+    uint8_t sleep_type, reserved, boost_delta_c, boost_time_s;
+    uint16_t forced_sleep_s;
+    uint8_t legacy_trust[12];
+    uint16_t family_template_uv[SETTINGS_PROFILE_CAP];
+    uint16_t family_template_mask;
+    uint8_t setup_complete, reserved_v11;
+    uint32_t checksum;
+} settings_record_v11_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version, size;
+    uint8_t active_profile, encoder_step_c, backlight_percent, buzzer_enabled;
+    uint8_t notification_flags, encoder_reversed, ignore_faults, drop_compensation_enabled;
+    uint32_t sleep_delay_ms;
+    tip_profile_t profiles[SETTINGS_PROFILE_CAP];
+    uint16_t presets_c[3], max_target_c, sleep_time_s;
+    uint8_t sleep_type, reserved, boost_delta_c, boost_time_s;
+    uint8_t setup_complete, reserved_v12[3];
+    uint32_t checksum;
 } settings_record_t;
 
 _Static_assert(sizeof(settings_record_t) <= SETTINGS_FLASH_BYTES,
@@ -105,12 +135,16 @@ _Static_assert(sizeof(settings_record_v7_t) == 608U,
                "legacy settings flash layout changed");
 _Static_assert(sizeof(settings_record_v8_t) == 612U,
                "legacy settings flash layout changed");
-_Static_assert(sizeof(settings_record_t) == 616U,
+_Static_assert(sizeof(settings_record_v9_t) == 616U, "Build 14 layout changed");
+_Static_assert(sizeof(settings_record_v11_t) == 652U, "version 11 layout changed");
+_Static_assert(sizeof(settings_record_t) == 620U,
                "settings flash layout changed; add a migration before release");
 
 static settings_record_t s_saved;
 static bool s_loaded;
 static bool s_tip_warning_enabled = true;
+static bool s_setup_complete;
+static uint8_t s_room_temperature_c = 30U;
 
 static uint32_t checksum_bytes(const void *record, size_t count)
 {
@@ -151,6 +185,9 @@ static void capture(settings_record_t *record)
     record->sleep_type = (uint8_t)control_sleep_type();
     record->boost_delta_c = control_boost_delta_c();
     record->boost_time_s = control_boost_time_s();
+    record->setup_complete = s_setup_complete;
+    /* Version 12 reserved byte: 0 means an older save; 1..51 encodes 0..50 C. */
+    record->reserved_v12[0] = (uint8_t)(s_room_temperature_c + 1U);
     profiles_export(record->profiles, SETTINGS_PROFILE_CAP);
     for (uint8_t i = 0; i < 3U; ++i) record->presets_c[i] = control_preset_c(i);
     record->checksum = checksum_record(record);
@@ -177,6 +214,10 @@ static void apply(const settings_record_t *record)
                             (record->notification_flags & 2U) != 0U : true;
     ui_set_display_orientation(record->version >= 7U ?
                                (record->notification_flags >> 2U) & 3U : 0U);
+    s_setup_complete = record->setup_complete != 0U;
+    s_room_temperature_c = record->reserved_v12[0] >= 1U &&
+        record->reserved_v12[0] <= 51U ?
+        (uint8_t)(record->reserved_v12[0] - 1U) : 30U;
     for (uint8_t i = 0; i < 3U; ++i) control_set_preset_c(i, record->presets_c[i]);
 }
 
@@ -197,7 +238,9 @@ void settings_factory_defaults(void)
     board_buzzer_enable(true);
     board_setpoint_beep_enable(true);
     s_tip_warning_enabled = true;
-    ui_set_display_orientation(0U);
+    ui_set_display_orientation(2U);
+    s_setup_complete = false;
+    s_room_temperature_c = 30U;
     control_set_preset_c(0, 300U);
     control_set_preset_c(1, 350U);
     control_set_preset_c(2, 400U);
@@ -216,6 +259,34 @@ void settings_init(void)
     /* Factory values are needed only for an empty/invalid page or to fill
      * fields that did not exist in an older saved record. */
     settings_factory_defaults();
+    if (flash->magic == SETTINGS_MAGIC && flash->version == 11U &&
+        flash->size == sizeof(settings_record_v11_t)) {
+        const settings_record_v11_t *old = (const settings_record_v11_t *)flash;
+        if (old->checksum == checksum_bytes(old, offsetof(settings_record_v11_t, checksum))) {
+            settings_record_t migrated = {0};
+            memcpy(&migrated, old, offsetof(settings_record_v9_t, checksum));
+            migrated.version = 12U;
+            migrated.setup_complete = old->setup_complete;
+            apply(&migrated);
+            capture(&s_saved);
+            s_loaded = false;
+            return;
+        }
+    }
+    if (flash->magic == SETTINGS_MAGIC && flash->version == 9U &&
+        flash->size == sizeof(settings_record_v9_t)) {
+        const settings_record_v9_t *old = (const settings_record_v9_t *)flash;
+        if (old->checksum == checksum_bytes(old, offsetof(settings_record_v9_t, checksum))) {
+            settings_record_t migrated = {0};
+            memcpy(&migrated, old, offsetof(settings_record_v9_t, checksum));
+            migrated.version = 12U;
+            migrated.setup_complete = 1U;
+            apply(&migrated);
+            capture(&s_saved);
+            s_loaded = false;
+            return;
+        }
+    }
     if (flash->magic == SETTINGS_MAGIC && flash->version == 8U &&
         flash->size == sizeof(settings_record_v8_t)) {
         const settings_record_v8_t *old = (const settings_record_v8_t *)flash;
@@ -292,5 +363,12 @@ bool settings_save(void)
 
 void settings_discard(void) { apply(&s_saved); }
 bool settings_loaded_from_flash(void) { return s_loaded; }
+bool settings_setup_complete(void) { return s_setup_complete; }
+void settings_set_setup_complete(bool complete) { s_setup_complete = complete; }
+uint8_t settings_room_temperature_c(void) { return s_room_temperature_c; }
+void settings_set_room_temperature_c(uint8_t room_c)
+{
+    s_room_temperature_c = room_c > 50U ? 50U : room_c;
+}
 bool settings_tip_warning_enabled(void) { return s_tip_warning_enabled; }
 void settings_set_tip_warning_enabled(bool enabled) { s_tip_warning_enabled = enabled; }
